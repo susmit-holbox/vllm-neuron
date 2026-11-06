@@ -542,6 +542,10 @@ class NeuronWorker(WorkerBase):
         self.weight_transfer_engine = None
         self._weight_update_active = False
 
+        # Sleep-mode backend (weight offload for RL rollouts). Created lazily on
+        # first sleep(); holds host-staged weights across suspend/resume.
+        self._sleep_mode_backend = None
+
         # Register models with ModelRegistry
         # Put it in the worker as vLLM's model registry overwrites vllm_neuron model registry
         # if we put it too early in the platform.py.
@@ -1186,6 +1190,55 @@ class NeuronWorker(WorkerBase):
         self.weight_transfer_engine.finish_weight_update()
         self._weight_update_active = False
 
+    def _get_sleep_mode_backend(self) -> Any:
+        """Resolve the Neuron sleep-mode backend, attaching the resident model.
+
+        Mirrors the GPU worker: the backend is created lazily on first sleep and
+        persists for the worker process. The Neuron backend needs the live model
+        (and draft model, if any) to stage/restore weights, so attach them here.
+        """
+        if self._sleep_mode_backend is None:
+            from vllm.device_allocator.sleep_mode_backend import (
+                SleepModeBackendFactory,
+            )
+
+            from vllm_neuron.vllm.worker.neuron_sleep_mode import (
+                NeuronSleepModeBackend,
+            )
+
+            backend = SleepModeBackendFactory.create_backend(
+                self.vllm_config.model_config
+            )
+            if not isinstance(backend, NeuronSleepModeBackend):
+                raise ValueError(
+                    "sleep_mode_backend must be 'neuron' for the Neuron "
+                    "sleep-mode backend; got "
+                    f"{self.vllm_config.model_config.sleep_mode_backend!r}"
+                )
+            drafter = getattr(self.model_runner, "drafter", None)
+            drafter_model = (
+                getattr(drafter, "model", None) if drafter is not None else None
+            )
+            backend.attach_model(self.model_runner.model, drafter_model=drafter_model)
+            self._sleep_mode_backend = backend
+        return self._sleep_mode_backend
+
+    def sleep(self, level: int = 1) -> None:
+        """Offload model weights to host RAM to free Neuron HBM.
+
+        The RL engine (or the ``/sleep`` endpoint) calls this on the worker.
+        ``level`` follows vLLM semantics: 1 offloads weights; 2 also saves and
+        drops non-persistent buffers.
+        """
+        self._get_sleep_mode_backend().suspend(level)
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        """Restore previously-offloaded weights into the resident model.
+
+        ``tags`` optionally limits restoration (e.g. ``["weights"]``).
+        """
+        self._get_sleep_mode_backend().resume(tags)
+
     def _configure_torchinductor_cache_dir(self) -> None:
         """Isolate this worker's TorchInductor cache by configuration and rank.
 
@@ -1429,6 +1482,10 @@ class NeuronWorker(WorkerBase):
         core owns the stack. At LNC 1 two logical cores share it, so each must
         plan against half of the stack. Without this scaling, both siblings size
         a KV cache against the same HBM and can fail during model load.
+
+        The ``model_weight_bytes`` reservation is load-bearing for sleep mode:
+        offloaded weights return to HBM on wake-up, so the KV budget must keep
+        reserving that space rather than assuming it is free while sleeping.
         """
         cores_per_stack = get_logical_cores_per_hbm_stack()
         if cores_per_stack > 1:

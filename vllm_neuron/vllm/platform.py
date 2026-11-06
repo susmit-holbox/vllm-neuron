@@ -1159,6 +1159,13 @@ class NeuronPlatform(Platform):
             )
 
     @classmethod
+    def is_sleep_mode_available(cls) -> bool:
+        # Sleep mode is served by the "neuron" SleepModeBackend registered in
+        # patches/__init__.py. CPU inference mode has no device weights to
+        # offload, so sleep is unavailable there.
+        return not envs.VLLM_NEURON_CPU_MODE
+
+    @classmethod
     def is_pin_memory_available(cls) -> bool:
         return False
 
