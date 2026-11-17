@@ -1162,6 +1162,12 @@ class NeuronPlatform(Platform):
     def is_pin_memory_available(cls) -> bool:
         return False
 
+    def is_sleep_mode_available(self) -> bool:
+        # A3 adds sleep/wake_up weight offload (NeuronWeightOffloader + worker
+        # sleep/wake_up/discard), so report sleep mode as available rather than
+        # inheriting the base False, which makes ModelConfig reject the engine.
+        return True
+
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
         import torch

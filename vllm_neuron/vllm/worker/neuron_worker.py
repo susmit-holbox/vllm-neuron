@@ -2263,30 +2263,44 @@ class NeuronWorker(WorkerBase):
         # it on the native path. The native path traces on the real device
         # (see build_prefill/build_decode_trace_jobs), so it doesn't hit the
         # meta/real-device rank-tensor collision the meta-trace path does.
-        if native_compile_only:
-            # The file-store rendezvous provides no port usable as a socket
-            # namespace, so give the native parallel-trace pool a stable
-            # per-engine compile-service socket (keyed by the executor parent
-            # pid, shared by all of this engine's workers).
-            os.environ.setdefault(
-                "NEURON_COMPILE_SERVICE_SOCKET",
-                f"/tmp/neuron_compile_service_{os.getuid()}_{os.getppid()}.sock",
-            )
-            parallel_trace(
-                jobs=jobs,
-                parent_rank=self.rank,
-                native_compile_only=True,
-            )
-        else:
-            # The fork-children meta-swap the model's params/buffers, but the SPMD
-            # rank tensors live on the vLLM group objects (not the model), so they
-            # stay on the real device and collide with the meta-traced graph. Swap
-            # them to meta for the duration of the (synchronous) trace pool — forked
-            # children inherit the meta tensors via copy-on-write; the parent's
-            # originals are restored on exit so the real per-rank value is bound at
-            # runtime.
-            with spmd_rank_tensors_on_meta():
-                parallel_trace(jobs=jobs, parent_rank=self.rank)
+        try:
+            if native_compile_only:
+                # The file-store rendezvous provides no port usable as a socket
+                # namespace, so give the native parallel-trace pool a stable
+                # per-engine compile-service socket (keyed by the executor parent
+                # pid, shared by all of this engine's workers).
+                os.environ.setdefault(
+                    "NEURON_COMPILE_SERVICE_SOCKET",
+                    f"/tmp/neuron_compile_service_{os.getuid()}_{os.getppid()}.sock",
+                )
+                parallel_trace(
+                    jobs=jobs,
+                    parent_rank=self.rank,
+                    native_compile_only=True,
+                )
+            else:
+                # The fork-children meta-swap the model's params/buffers, but the SPMD
+                # rank tensors live on the vLLM group objects (not the model), so they
+                # stay on the real device and collide with the meta-traced graph. Swap
+                # them to meta for the duration of the (synchronous) trace pool — forked
+                # children inherit the meta tensors via copy-on-write; the parent's
+                # originals are restored on exit so the real per-rank value is bound at
+                # runtime.
+                with spmd_rank_tensors_on_meta():
+                    parallel_trace(jobs=jobs, parent_rank=self.rank)
+        except RuntimeError as e:
+            # In the multiproc executor the worker is itself a spawned subprocess,
+            # so the parallel-trace fork pool (os.fork lanes that posix_spawn the
+            # neuronx-cc compiler) fails with "posix_spawn failed". Fall back to
+            # the in-process sequential compile path instead of failing the engine.
+            if "fork" in str(e).lower() or "spawn" in str(e).lower():
+                logger.warning(
+                    "Parallel trace fork failed (%s); falling back to "
+                    "sequential in-process compilation.",
+                    e,
+                )
+                return False
+            raise
         return True
 
     def _prefill_compile_targets(self) -> list[tuple[int, int]]:
